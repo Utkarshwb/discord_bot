@@ -1,6 +1,5 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { db } = require('./db/index');
 const { messages } = require('./db/schema');
 const { eq, asc } = require('drizzle-orm');
@@ -14,13 +13,14 @@ const discord = new Client({
   ]
 });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({
-  model: 'gemini-3-flash-preview',
-  systemInstruction: persona.systemPrompt,
+// OpenRouter uses OpenAI-compatible API
+const Groq = require('groq-sdk');
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
 
-const MAX_HISTORY = 10; // exchanges per user
+const MAX_HISTORY = 10;
 
 // Get last N messages for a user from DB
 async function getHistory(userId) {
@@ -29,21 +29,20 @@ async function getHistory(userId) {
     .from(messages)
     .where(eq(messages.userId, userId))
     .orderBy(asc(messages.createdAt))
-    .limit(MAX_HISTORY * 2); // 10 exchanges = 20 messages
+    .limit(MAX_HISTORY * 2);
 
-  // Convert to Gemini format
   return rows.map(row => ({
-    role: row.role,
-    parts: [{ text: row.content }],
+    role: row.role === 'model' ? 'assistant' : row.role, // openai uses 'assistant' not 'model'
+    content: row.content,
   }));
 }
 
-// Save a message to DB
+// Save message to DB
 async function saveMessage(userId, role, content) {
   await db.insert(messages).values({ userId, role, content });
 }
 
-// Keep only latest MAX_HISTORY exchanges per user (trim old ones)
+// Trim old messages
 async function trimHistory(userId) {
   const rows = await db
     .select({ id: messages.id })
@@ -51,12 +50,9 @@ async function trimHistory(userId) {
     .where(eq(messages.userId, userId))
     .orderBy(asc(messages.createdAt));
 
-  // If over limit, delete oldest ones
   if (rows.length > MAX_HISTORY * 2) {
     const toDelete = rows.slice(0, rows.length - MAX_HISTORY * 2);
-    const idsToDelete = toDelete.map(r => r.id);
-
-    for (const id of idsToDelete) {
+    for (const { id } of toDelete) {
       await db.delete(messages).where(eq(messages.id, id));
     }
   }
@@ -64,7 +60,7 @@ async function trimHistory(userId) {
 
 discord.once('ready', () => {
   console.log(`✅ ${persona.name} is online as ${discord.user.tag}`);
-  console.log(`🗄️  Connected to Supabase`);
+  console.log(`🔀 Using OpenRouter`);
 });
 
 discord.on('messageCreate', async (message) => {
@@ -84,25 +80,26 @@ discord.on('messageCreate', async (message) => {
 
   try {
     const userId = message.author.id;
-
-    // Get history from Supabase
     const history = await getHistory(userId);
 
-    // Start Gemini chat with history
-    const chat = model.startChat({ history });
+    const response = await groq.chat.completions.create({
+  model: 'llama-3.3-70b-versatile', // fast + smart + free
+  messages: [
+    { role: 'system', content: persona.systemPrompt },
+    ...history,
+    { role: 'user', content: userMessage },
+  ],
+  max_tokens: 500, // keep replies short = faster
+});
 
-    // Send message to Gemini
-    const result = await chat.sendMessage(userMessage);
-    const botReply = result.response.text();
+const botReply = response.choices[0].message.content;
 
-    // Save both messages to Supabase
+    // Save to DB (use 'assistant' for openai format)
     await saveMessage(userId, 'user', userMessage);
-    await saveMessage(userId, 'model', botReply);
-
-    // Trim old messages to keep only latest 10 exchanges
+    await saveMessage(userId, 'assistant', botReply);
     await trimHistory(userId);
 
-    // Send reply (handle Discord 2000 char limit)
+    // Handle Discord 2000 char limit
     if (botReply.length > 1990) {
       const chunks = botReply.match(/.{1,1990}/gs);
       for (const chunk of chunks) {
@@ -114,7 +111,11 @@ discord.on('messageCreate', async (message) => {
 
   } catch (error) {
     console.error('Error:', error);
-    await message.reply("okay something broke and it's not my fault 😭 try again");
+    if (error.status === 429) {
+      await message.reply("okay too many messages, give me a sec 😭 try in a minute");
+    } else {
+      await message.reply("okay something broke and it's not my fault 😭 try again");
+    }
   }
 });
 
