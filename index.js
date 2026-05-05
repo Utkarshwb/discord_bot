@@ -265,7 +265,6 @@ function logMessageForRecap(username, content) {
   // Keep only last 100 messages
   if (hourlyMessageLog.length > 100) hourlyMessageLog.shift();
 }
-
 async function sendHourlyRecap() {
   try {
     const channelId = await getConfig('recap_channel');
@@ -274,30 +273,26 @@ async function sendHourlyRecap() {
     const channel = await discord.channels.fetch(channelId).catch(() => null);
     if (!channel) return;
 
-    if (hourlyMessageLog.length === 0) {
-      await channel.send("okay it's been dead quiet for the past hour... what is everyone doing 😐");
-      return;
-    }
+    const hour = new Date().getHours();
 
-    // Build recap context
-    const summary = hourlyMessageLog
-      .slice(-30) // last 30 messages
-      .map(m => `${m.username}: ${m.content}`)
-      .join('\n');
+    // Time-aware context so she feels real
+    let timeContext = '';
+    if (hour >= 0  && hour < 5)  timeContext = "it's like 3am and you can't sleep";
+    else if (hour < 9)           timeContext = "it's early morning, you just woke up groggy";
+    else if (hour < 12)          timeContext = "it's morning, you're in class pretending to pay attention";
+    else if (hour < 15)          timeContext = "it's afternoon, post lunch slump hitting hard";
+    else if (hour < 18)          timeContext = "it's evening, done with classes, finally free";
+    else if (hour < 21)          timeContext = "it's night, supposed to be studying but not really";
+    else                         timeContext = "it's late night, procrastinating hard";
 
-    hourlyMessageLog.length = 0; // clear after recap
+    const prompt = `You are Maithili. ${timeContext}. Send ONE random casual message to your Discord server — like something you'd just type out of nowhere. Could be a random thought, a complaint, something funny that happened, a question, anything. Keep it very short (1-2 lines max). Natural, not forced. Don't start with "okay" every time. No hashtags. No emojis overload. Just text like a real person.`;
 
-    const recapPrompt = `Here's what happened in the Discord server in the last hour. Give a short sarcastic funny recap as Maithili. Keep it under 150 words. Be specific about what people said. Roast them lovingly. Don't use bullet points — just talk naturally like you're texting.
+    const randomMessage = await getReply([], prompt, persona.systemPrompt);
+    await sendToChannel(channel, randomMessage);
 
-Messages from the last hour:
-${summary}`;
-
-    const recap = await getReply([], recapPrompt, persona.systemPrompt);
-    await sendToChannel(channel, `📋 **hourly recap by maithili:**\n${recap}`);
-
-    console.log('✅ Hourly recap sent');
+    console.log('✅ Hourly message sent');
   } catch (err) {
-    console.error('Recap error:', err);
+    console.error('Hourly message error:', err);
   }
 }
 
