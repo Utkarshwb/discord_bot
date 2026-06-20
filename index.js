@@ -235,7 +235,8 @@ async function getReply(history, userMessage, systemPrompt) {
       continue;
     }
   }
-  throw new Error('ALL_PROVIDERS_DOWN');
+
+  return "i'm a bit rate-limited right now 😭 try again in a little bit";
 }
 
 // ─── Send helper (handles 2000 char limit) ─────────────────────────────────
@@ -383,18 +384,16 @@ discord.on('messageCreate', async (message) => {
 
     // Save to DB
     await saveMessage(userId, 'user', userMessage);
-    await saveMessage(userId, 'assistant', botReply);
+    if (botReply !== "i'm a bit rate-limited right now 😭 try again in a little bit") {
+      await saveMessage(userId, 'assistant', botReply);
+    }
     await trimHistory(userId);
 
     await sendReply(message, botReply);
 
   } catch (error) {
     console.error('Fatal error:', error);
-    if (error.message === 'ALL_PROVIDERS_DOWN') {
-      await message.reply("okay all my brains are fried rn 😭 try again in an hour");
-    } else {
-      await message.reply("okay something broke and it's not my fault 😭 try again");
-    }
+    await message.reply("okay something broke and it's not my fault 😭 try again");
   }
 });
 
