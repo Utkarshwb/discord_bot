@@ -297,7 +297,7 @@ async function sendHourlyRecap() {
 }
 
 // ─── Discord Events ────────────────────────────────────────────────────────
-discord.once('ready', async () => {
+discord.once('clientReady', async () => {
   console.log(`✅ ${persona.name} is online as ${discord.user.tag}`);
   console.log(`🔄 Provider rotation: Groq → Gemini → OpenRouter`);
   console.log(`👑 Utkarsh ID: ${UTKARSH_USER_ID || 'not set'}`);
