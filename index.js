@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
 const Groq = require('groq-sdk');
+const express = require('express');
 // const OpenAI = require('openai');
 // const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { db } = require('./db/index');
@@ -398,3 +399,25 @@ discord.on('messageCreate', async (message) => {
 });
 
 discord.login(process.env.DISCORD_TOKEN);
+
+// Start a minimal web server so hosting providers treat this as a web service
+const app = express();
+
+let lastKeepalive = null;
+
+app.get('/', (req, res) => res.send('Maithili bot is running'));
+
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime(), lastKeepalive }));
+app.head('/health', (req, res) => res.sendStatus(200));
+
+// External cron/uptime pings should call this endpoint every ~15 minutes
+app.all('/keepalive', (req, res) => {
+  lastKeepalive = new Date().toISOString();
+  console.log(`✅ Keepalive received: ${lastKeepalive}`);
+  res.json({ status: 'ok', lastKeepalive });
+});
+
+app.get('/last-ping', (req, res) => res.json({ lastKeepalive }));
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`🌐 Web server listening on port ${port}`));
