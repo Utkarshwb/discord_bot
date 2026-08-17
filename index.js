@@ -38,11 +38,11 @@ const cerebras = process.env.CEREBRAS_API_KEY
 const TEXT_MODEL   = 'openai/gpt-oss-120b';
 const TEXT_MODEL_CEREBRAS = 'gpt-oss-120b'; // Cerebras uses no "openai/" prefix
 
-// Vision model: Meta's Llama 4 Scout, free + vision-capable on Groq as of
-// Aug 2026. Groq has deprecated vision models before (Maverick, Feb 2026) —
-// if this starts failing, check console.groq.com/docs/models for a current
-// vision-capable replacement.
-const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+// Vision model: Qwen 3.6 27B — as of Aug 2026 this is the ONLY vision-capable
+// model on Groq (confirmed via console.groq.com/docs/vision). Groq has
+// deprecated every prior vision model (Llama 4 Scout, Maverick) — if this
+// starts failing too, check console.groq.com/docs/vision for the current one.
+const VISION_MODEL = 'qwen/qwen3.6-27b';
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const UTKARSH_USER_ID    = process.env.UTKARSH_USER_ID; // his Discord ID
@@ -294,7 +294,7 @@ async function getVisionReply(imageUrl, userText, systemPrompt) {
     console.error('⚠️  Vision model error:', error.message);
     // Groq has deprecated vision models before without much warning —
     // surface a clear signal in the logs so it's obvious what broke.
-    console.error(`⚠️  ${VISION_MODEL} may be deprecated — check console.groq.com/docs/models`);
+    console.error(`⚠️  ${VISION_MODEL} may be deprecated — check console.groq.com/docs/vision`);
     return "i can't see images right now, something's off with my eyes 👀 try again later";
   }
 }
