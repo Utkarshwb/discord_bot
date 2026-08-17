@@ -273,6 +273,12 @@ async function tryVision(imageUrl, userText, systemPrompt) {
   const response = await groq.chat.completions.create({
     model: VISION_MODEL,
     max_tokens: MAX_OUTPUT_TOKENS,
+    // Qwen 3.6 27B is a thinking model — without these it dumps its raw
+    // <think>...</think> reasoning into the reply instead of just answering.
+    // 'none' fully disables reasoning; reasoning_format:'hidden' is a backup
+    // in case any reasoning slips through anyway.
+    reasoning_effort: 'none',
+    reasoning_format: 'hidden',
     messages: [
       { role: 'system', content: systemPrompt },
       {
@@ -284,7 +290,9 @@ async function tryVision(imageUrl, userText, systemPrompt) {
       },
     ],
   });
-  return response.choices[0].message.content;
+  const raw = response.choices[0].message.content;
+  // Safety net: strip any <think>...</think> block that slips through
+  return raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim() || raw;
 }
 
 async function getVisionReply(imageUrl, userText, systemPrompt) {
