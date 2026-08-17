@@ -20,7 +20,29 @@ const discord = new Client({
 
 // ─── AI Providers ──────────────────────────────────────────────────────────
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// Optional second Groq-SDK client pointed at Cerebras (same OpenAI-compatible
+// shape). Only used if CEREBRAS_API_KEY is set in .env — safe to leave unset.
+const cerebras = process.env.CEREBRAS_API_KEY
+  ? new Groq({
+      apiKey: process.env.CEREBRAS_API_KEY,
+      baseURL: 'https://api.cerebras.ai/v1',
+    })
+  : null;
+
 // const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// ─── Model config ──────────────────────────────────────────────────────────
+// Text model: OpenAI's open-weight GPT-OSS-120B, served free via Groq.
+// (Not OpenAI's own API — Groq hosts these open weights for free.)
+const TEXT_MODEL   = 'openai/gpt-oss-120b';
+const TEXT_MODEL_CEREBRAS = 'gpt-oss-120b'; // Cerebras uses no "openai/" prefix
+
+// Vision model: Meta's Llama 4 Scout, free + vision-capable on Groq as of
+// Aug 2026. Groq has deprecated vision models before (Maverick, Feb 2026) —
+// if this starts failing, check console.groq.com/docs/models for a current
+// vision-capable replacement.
+const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const UTKARSH_USER_ID    = process.env.UTKARSH_USER_ID; // his Discord ID
@@ -164,10 +186,24 @@ async function setConfig(key, value) {
   }
 }
 
-// ─── AI Providers ──────────────────────────────────────────────────────────
+// ─── AI Providers: text ─────────────────────────────────────────────────────
 async function tryGroq(history, userMessage, systemPrompt) {
   const response = await groq.chat.completions.create({
-    model: 'openai/gpt-oss-120b', // ← changed from 'llama-3.1-8b-instant'
+    model: TEXT_MODEL,
+    max_tokens: MAX_OUTPUT_TOKENS,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      ...history,
+      { role: 'user', content: userMessage },
+    ],
+  });
+  return response.choices[0].message.content;
+}
+
+async function tryCerebras(history, userMessage, systemPrompt) {
+  if (!cerebras) throw new Error('Cerebras not configured (no CEREBRAS_API_KEY)');
+  const response = await cerebras.chat.completions.create({
+    model: TEXT_MODEL_CEREBRAS,
     max_tokens: MAX_OUTPUT_TOKENS,
     messages: [
       { role: 'system', content: systemPrompt },
@@ -192,24 +228,11 @@ async function tryGemini(history, userMessage, systemPrompt) {
   return result.response.text();
 }
 
-async function tryOpenRouter(history, userMessage, systemPrompt) {
-  const response = await openrouter.chat.completions.create({
-    model: 'openrouter/free',
-    max_tokens: MAX_OUTPUT_TOKENS,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...history,
-      { role: 'user', content: userMessage },
-    ],
-  });
-  return response.choices[0].message.content;
-}
-
 async function getReply(history, userMessage, systemPrompt) {
   const providers = [
-    { name: 'groq',       fn: tryGroq },
+    { name: 'groq',     fn: tryGroq },
+    { name: 'cerebras', fn: tryCerebras }, // skipped automatically if not configured
     // { name: 'gemini',     fn: tryGemini },
-    // { name: 'openrouter', fn: tryOpenRouter },
   ];
 
   for (const provider of providers) {
@@ -225,6 +248,9 @@ async function getReply(history, userMessage, systemPrompt) {
       }
       return reply;
     } catch (error) {
+      if (error.message === `Cerebras not configured (no CEREBRAS_API_KEY)`) {
+        continue; // silent skip, not a real failure
+      }
       if (error.status === 429) {
         const retryAfter = error.headers?.['retry-after'];
         const cooldownMs = retryAfter ? parseInt(retryAfter) * 1000 : 60 * 60 * 1000;
@@ -238,6 +264,39 @@ async function getReply(history, userMessage, systemPrompt) {
   }
 
   return "i'm a bit rate-limited right now 😭 try again in a little bit";
+}
+
+// ─── AI Providers: vision ───────────────────────────────────────────────────
+// Discord attachment URLs are publicly fetchable, so we pass the URL straight
+// through — no need to download/base64 the image ourselves.
+async function tryVision(imageUrl, userText, systemPrompt) {
+  const response = await groq.chat.completions.create({
+    model: VISION_MODEL,
+    max_tokens: MAX_OUTPUT_TOKENS,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: userText || "what's in this image?" },
+          { type: 'image_url', image_url: { url: imageUrl } },
+        ],
+      },
+    ],
+  });
+  return response.choices[0].message.content;
+}
+
+async function getVisionReply(imageUrl, userText, systemPrompt) {
+  try {
+    return await tryVision(imageUrl, userText, systemPrompt);
+  } catch (error) {
+    console.error('⚠️  Vision model error:', error.message);
+    // Groq has deprecated vision models before without much warning —
+    // surface a clear signal in the logs so it's obvious what broke.
+    console.error(`⚠️  ${VISION_MODEL} may be deprecated — check console.groq.com/docs/models`);
+    return "i can't see images right now, something's off with my eyes 👀 try again later";
+  }
 }
 
 // ─── Send helper (handles 2000 char limit) ─────────────────────────────────
@@ -301,7 +360,8 @@ async function sendHourlyRecap() {
 // ─── Discord Events ────────────────────────────────────────────────────────
 discord.once('clientReady', async () => {
   console.log(`✅ ${persona.name} is online as ${discord.user.tag}`);
-  console.log(`🔄 Provider rotation: Groq → Gemini → OpenRouter`);
+  console.log(`🔄 Text provider rotation: Groq (${TEXT_MODEL}) → ${cerebras ? `Cerebras (${TEXT_MODEL_CEREBRAS})` : 'Cerebras (not configured)'}`);
+  console.log(`👁️  Vision model: ${VISION_MODEL} (Groq)`);
   console.log(`👑 Utkarsh ID: ${UTKARSH_USER_ID || 'not set'}`);
 
   // Start hourly recap timer
@@ -336,7 +396,12 @@ discord.on('messageCreate', async (message) => {
     .replace(`<@${discord.user.id}>`, '')
     .trim();
 
-  if (!userMessage) {
+  // Check for an image attachment
+  const imageAttachment = message.attachments.find(a =>
+    a.contentType?.startsWith('image/')
+  );
+
+  if (!userMessage && !imageAttachment) {
     await message.reply("you called? say something na 🙄");
     return;
   }
@@ -371,6 +436,19 @@ discord.on('messageCreate', async (message) => {
     // Build personalized system prompt
     const systemPrompt = buildSystemPrompt(user);
 
+    // ── Image path: route straight to the vision model, skip history/text flow ──
+    if (imageAttachment) {
+      const botReply = await getVisionReply(imageAttachment.url, userMessage, systemPrompt);
+
+      await saveMessage(userId, 'user', userMessage ? `[image] ${userMessage}` : '[image]');
+      await saveMessage(userId, 'assistant', botReply);
+      await trimHistory(userId);
+
+      await sendReply(message, botReply);
+      return;
+    }
+
+    // ── Normal text path ──
     // Get history
     const fullHistory   = await getHistory(userId);
     const fittedHistory = fitHistoryToTokenBudget(fullHistory, systemPrompt, userMessage);
