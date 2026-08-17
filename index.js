@@ -167,7 +167,7 @@ async function setConfig(key, value) {
 // ─── AI Providers ──────────────────────────────────────────────────────────
 async function tryGroq(history, userMessage, systemPrompt) {
   const response = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
+    model: 'openai/gpt-oss-120b', // ← changed from 'llama-3.1-8b-instant'
     max_tokens: MAX_OUTPUT_TOKENS,
     messages: [
       { role: 'system', content: systemPrompt },
