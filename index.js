@@ -269,7 +269,10 @@ async function getReply(history, userMessage, systemPrompt) {
 // ─── AI Providers: vision ───────────────────────────────────────────────────
 // Discord attachment URLs are publicly fetchable, so we pass the URL straight
 // through — no need to download/base64 the image ourselves.
-async function tryVision(imageUrl, userText, systemPrompt) {
+// Step 1: Qwen reads the image and returns a plain, neutral description —
+// no persona here, just facts about what's in the image. GPT-OSS then turns
+// this into an actual in-character reply (see getVisionReply below).
+async function tryVision(imageUrl, userText) {
   const response = await groq.chat.completions.create({
     model: VISION_MODEL,
     max_tokens: MAX_OUTPUT_TOKENS,
@@ -280,7 +283,10 @@ async function tryVision(imageUrl, userText, systemPrompt) {
     reasoning_effort: 'none',
     reasoning_format: 'hidden',
     messages: [
-      { role: 'system', content: systemPrompt },
+      {
+        role: 'system',
+        content: 'Describe what is in the image factually and concisely, in 1-3 sentences. Plain description only — no persona, no opinions, no roleplay.',
+      },
       {
         role: 'user',
         content: [
@@ -295,16 +301,26 @@ async function tryVision(imageUrl, userText, systemPrompt) {
   return raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim() || raw;
 }
 
-async function getVisionReply(imageUrl, userText, systemPrompt) {
+// Step 2: feed Qwen's plain description into the normal GPT-OSS persona
+// pipeline (getReply), so Maithili's voice/personality stays consistent
+// whether she's replying to text or to an image.
+async function getVisionReply(imageUrl, userText, systemPrompt, history) {
+  let description;
   try {
-    return await tryVision(imageUrl, userText, systemPrompt);
+    description = await tryVision(imageUrl, userText);
   } catch (error) {
     console.error('⚠️  Vision model error:', error.message);
-    // Groq has deprecated vision models before without much warning —
-    // surface a clear signal in the logs so it's obvious what broke.
     console.error(`⚠️  ${VISION_MODEL} may be deprecated — check console.groq.com/docs/vision`);
     return "i can't see images right now, something's off with my eyes 👀 try again later";
   }
+
+  const framedMessage = userText
+    ? `[user sent an image] Image shows: ${description}\nUser also said: ${userText}`
+    : `[user sent an image] Image shows: ${description}`;
+
+  // Now let the normal text pipeline (GPT-OSS on Groq/Cerebras) write the
+  // actual in-character reply, same as it would for a text message.
+  return getReply(history, framedMessage, systemPrompt);
 }
 
 // ─── Send helper (handles 2000 char limit) ─────────────────────────────────
