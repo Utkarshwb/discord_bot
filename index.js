@@ -1,11 +1,9 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
+const { Client, GatewayIntentBits } = require('discord.js');
 const Groq = require('groq-sdk');
 const express = require('express');
-// const OpenAI = require('openai');
-// const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { db } = require('./db/index');
-const { messages, users, config } = require('./db/schema');
+const { messages, users } = require('./db/schema');
 const { eq, asc, inArray } = require('drizzle-orm');
 const persona = require('./persona');
 
@@ -30,12 +28,9 @@ const cerebras = process.env.CEREBRAS_API_KEY
     })
   : null;
 
-// const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
 // ─── Model config ──────────────────────────────────────────────────────────
 // Text model: OpenAI's open-weight GPT-OSS-120B, served free via Groq.
-// (Not OpenAI's own API — Groq hosts these open weights for free.)
-const TEXT_MODEL   = 'openai/gpt-oss-120b';
+const TEXT_MODEL          = 'openai/gpt-oss-120b';
 const TEXT_MODEL_CEREBRAS = 'gpt-oss-120b'; // Cerebras uses no "openai/" prefix
 
 // Vision model: Qwen 3.6 27B — as of Aug 2026 this is the ONLY vision-capable
@@ -44,13 +39,17 @@ const TEXT_MODEL_CEREBRAS = 'gpt-oss-120b'; // Cerebras uses no "openai/" prefix
 // starts failing too, check console.groq.com/docs/vision for the current one.
 const VISION_MODEL = 'qwen/qwen3.6-27b';
 
+// Sentinel string — used in one place to avoid saving error replies to the DB.
+// Defined as a constant so a wording change never silently breaks the guard.
+const RATE_LIMIT_REPLY = "i'm a bit rate-limited right now 😭 try again in a little bit";
+
 // ─── Config ────────────────────────────────────────────────────────────────
-const UTKARSH_USER_ID    = process.env.UTKARSH_USER_ID; // his Discord ID
-const CHARS_PER_TOKEN    = 4;
-const MAX_INPUT_TOKENS   = 2000;
-const MAX_OUTPUT_TOKENS  = 400;
+const UTKARSH_USER_ID     = process.env.UTKARSH_USER_ID; // his Discord ID
+const CHARS_PER_TOKEN     = 4;
+const MAX_INPUT_TOKENS    = 2000;
+const MAX_OUTPUT_TOKENS   = 400;
 const MAX_STORED_MESSAGES = 30;
-const COOLDOWN_MS        = 5000;
+const COOLDOWN_MS         = 5000;
 
 // ─── State ─────────────────────────────────────────────────────────────────
 const providerCooldowns = {};
@@ -88,7 +87,7 @@ function isOnCooldown(provider) {
 
 function setCooldown(provider, ms) {
   providerCooldowns[provider] = Date.now() + ms;
-  console.log(`⏳ ${provider} cooldown: ${Math.round(ms/60000)}min`);
+  console.log(`⏳ ${provider} cooldown: ${Math.round(ms / 60000)}min`);
 }
 
 // ─── DB: messages ──────────────────────────────────────────────────────────
@@ -119,23 +118,25 @@ async function trimHistory(userId) {
   }
 }
 
-// ─── DB: users (name memory + Utkarsh flag) ────────────────────────────────
+// ─── DB: users ─────────────────────────────────────────────────────────────
 async function getUser(userId) {
   const rows = await db.select().from(users).where(eq(users.userId, userId));
   return rows[0] || null;
 }
 
+// Single-query upsert — INSERT ... ON CONFLICT DO UPDATE avoids 2 round trips
+// and eliminates any race condition between the read and write.
 async function upsertUser(userId, name) {
-  const existing = await getUser(userId);
-  if (existing) {
-    await db.update(users).set({ name, updatedAt: new Date() }).where(eq(users.userId, userId));
-  } else {
-    await db.insert(users).values({
+  await db.insert(users)
+    .values({
       userId,
       name,
-      isUtkarsh: userId === UTKARSH_USER_ID ? 'true' : 'false',
+      isUtkarsh: userId === UTKARSH_USER_ID,
+    })
+    .onConflictDoUpdate({
+      target: users.userId,
+      set: { name, updatedAt: new Date() },
     });
-  }
 }
 
 // Extract name from message if user introduces themselves
@@ -153,7 +154,7 @@ function extractName(text) {
 
 // Build system prompt — different for Utkarsh vs normal users
 function buildSystemPrompt(user) {
-  const isUtkarsh = user?.isUtkarsh === 'true';
+  const isUtkarsh = !!user?.isUtkarsh; // boolean column — truthy check is enough
   const nameContext = user?.name
     ? `\nThe person you're talking to is called ${user.name}. Use their name naturally sometimes, not every message.`
     : '';
@@ -169,21 +170,6 @@ SPECIAL — YOU ARE TALKING TO UTKARSH RIGHT NOW:
 - Don't make it cringe or lovey dovey — just slightly more personal than with others` : '';
 
   return persona.systemPrompt + nameContext + utkarshAddition;
-}
-
-// ─── DB: config (recap channel) ────────────────────────────────────────────
-async function getConfig(key) {
-  const rows = await db.select().from(config).where(eq(config.key, key));
-  return rows[0]?.value || null;
-}
-
-async function setConfig(key, value) {
-  const existing = await getConfig(key);
-  if (existing !== null) {
-    await db.update(config).set({ value }).where(eq(config.key, key));
-  } else {
-    await db.insert(config).values({ key, value });
-  }
 }
 
 // ─── AI Providers: text ─────────────────────────────────────────────────────
@@ -214,25 +200,10 @@ async function tryCerebras(history, userMessage, systemPrompt) {
   return response.choices[0].message.content;
 }
 
-async function tryGemini(history, userMessage, systemPrompt) {
-  const model = gemini.getGenerativeModel({
-    model: 'gemini-2.5-flash-lite',
-    systemInstruction: systemPrompt,
-  });
-  const geminiHistory = history.map(m => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
-  const chat = model.startChat({ history: geminiHistory });
-  const result = await chat.sendMessage(userMessage);
-  return result.response.text();
-}
-
 async function getReply(history, userMessage, systemPrompt) {
   const providers = [
     { name: 'groq',     fn: tryGroq },
     { name: 'cerebras', fn: tryCerebras }, // skipped automatically if not configured
-    // { name: 'gemini',     fn: tryGemini },
   ];
 
   for (const provider of providers) {
@@ -248,7 +219,7 @@ async function getReply(history, userMessage, systemPrompt) {
       }
       return reply;
     } catch (error) {
-      if (error.message === `Cerebras not configured (no CEREBRAS_API_KEY)`) {
+      if (error.message === 'Cerebras not configured (no CEREBRAS_API_KEY)') {
         continue; // silent skip, not a real failure
       }
       if (error.status === 429) {
@@ -263,7 +234,7 @@ async function getReply(history, userMessage, systemPrompt) {
     }
   }
 
-  return "i'm a bit rate-limited right now 😭 try again in a little bit";
+  return RATE_LIMIT_REPLY;
 }
 
 // ─── AI Providers: vision ───────────────────────────────────────────────────
@@ -278,8 +249,6 @@ async function tryVision(imageUrl, userText) {
     max_tokens: MAX_OUTPUT_TOKENS,
     // Qwen 3.6 27B is a thinking model — without these it dumps its raw
     // <think>...</think> reasoning into the reply instead of just answering.
-    // 'none' fully disables reasoning; reasoning_format:'hidden' is a backup
-    // in case any reasoning slips through anyway.
     reasoning_effort: 'none',
     reasoning_format: 'hidden',
     messages: [
@@ -318,8 +287,6 @@ async function getVisionReply(imageUrl, userText, systemPrompt, history) {
     ? `[user sent an image] Image shows: ${description}\nUser also said: ${userText}`
     : `[user sent an image] Image shows: ${description}`;
 
-  // Now let the normal text pipeline (GPT-OSS on Groq/Cerebras) write the
-  // actual in-character reply, same as it would for a text message.
   return getReply(history, framedMessage, systemPrompt);
 }
 
@@ -333,87 +300,18 @@ async function sendReply(target, text) {
   }
 }
 
-async function sendToChannel(channel, text) {
-  if (text.length > 1990) {
-    const chunks = text.match(/.{1,1990}/gs);
-    for (const chunk of chunks) await channel.send(chunk);
-  } else {
-    await channel.send(text);
-  }
-}
-
-// ─── Hourly Recap ──────────────────────────────────────────────────────────
-const hourlyMessageLog = []; // stores last hour's messages
-
-function logMessageForRecap(username, content) {
-  hourlyMessageLog.push({ username, content, time: new Date() });
-  // Keep only last 100 messages
-  if (hourlyMessageLog.length > 100) hourlyMessageLog.shift();
-}
-async function sendHourlyRecap() {
-  try {
-    const channelId = await getConfig('recap_channel');
-    if (!channelId) return;
-
-    const channel = await discord.channels.fetch(channelId).catch(() => null);
-    if (!channel) return;
-
-    const hour = new Date().getHours();
-
-    // Time-aware context so she feels real
-    let timeContext = '';
-    if (hour >= 0  && hour < 5)  timeContext = "it's like 3am and you can't sleep";
-    else if (hour < 9)           timeContext = "it's early morning, you just woke up groggy";
-    else if (hour < 12)          timeContext = "it's morning, you're in class pretending to pay attention";
-    else if (hour < 15)          timeContext = "it's afternoon, post lunch slump hitting hard";
-    else if (hour < 18)          timeContext = "it's evening, done with classes, finally free";
-    else if (hour < 21)          timeContext = "it's night, supposed to be studying but not really";
-    else                         timeContext = "it's late night, procrastinating hard";
-
-    const prompt = `You are Maithili. ${timeContext}. Send ONE random casual message to your Discord server — like something you'd just type out of nowhere. Could be a random thought, a complaint, something funny that happened, a question, anything. Keep it very short (1-2 lines max). Natural, not forced. Don't start with "okay" every time. No hashtags. No emojis overload. Just text like a real person.`;
-
-    const randomMessage = await getReply([], prompt, persona.systemPrompt);
-    await sendToChannel(channel, randomMessage);
-
-    console.log('✅ Hourly message sent');
-  } catch (err) {
-    console.error('Hourly message error:', err);
-  }
-}
-
 // ─── Discord Events ────────────────────────────────────────────────────────
-discord.once('clientReady', async () => {
+discord.once('clientReady', () => {
   console.log(`✅ ${persona.name} is online as ${discord.user.tag}`);
   console.log(`🔄 Text provider rotation: Groq (${TEXT_MODEL}) → ${cerebras ? `Cerebras (${TEXT_MODEL_CEREBRAS})` : 'Cerebras (not configured)'}`);
   console.log(`👁️  Vision model: ${VISION_MODEL} (Groq)`);
   console.log(`👑 Utkarsh ID: ${UTKARSH_USER_ID || 'not set'}`);
-
-  // Start hourly recap timer
-  const now = new Date();
-  const msUntilNextHour = (60 - now.getMinutes()) * 60000 - now.getSeconds() * 1000;
-
-  setTimeout(() => {
-    sendHourlyRecap();
-    setInterval(sendHourlyRecap, 60 * 60 * 1000); // every hour
-  }, msUntilNextHour);
-
-  console.log(`⏰ Hourly recap starts in ${Math.round(msUntilNextHour/60000)} minutes`);
 });
 
 discord.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // Log every message for recap (not just mentions)
-  logMessageForRecap(message.author.username, message.content);
-
-  // !setrecap command — set recap channel
-  if (message.content === '!setrecap') {
-    await setConfig('recap_channel', message.channelId);
-    await message.reply("okay i'll drop my hourly tea here 📋");
-    return;
-  }
-
-  // Only respond to mentions after this point
+  // Only respond to mentions
   if (!message.mentions.has(discord.user)) return;
 
   const userMessage = message.content
@@ -452,7 +350,6 @@ discord.on('messageCreate', async (message) => {
       user = await getUser(userId);
       console.log(`📝 Saved name: ${detectedName} for ${userId}`);
     } else if (!user) {
-      // Create basic user profile
       await upsertUser(userId, null);
       user = await getUser(userId);
     }
@@ -460,12 +357,13 @@ discord.on('messageCreate', async (message) => {
     // Build personalized system prompt
     const systemPrompt = buildSystemPrompt(user);
 
-    // ── Image path: route straight to the vision model, skip history/text flow ──
+    // ── Image path ──
     if (imageAttachment) {
-      const botReply = await getVisionReply(imageAttachment.url, userMessage, systemPrompt);
+      const fullHistory = await getHistory(userId);
+      const botReply = await getVisionReply(imageAttachment.url, userMessage, systemPrompt, fullHistory);
 
       await saveMessage(userId, 'user', userMessage ? `[image] ${userMessage}` : '[image]');
-      await saveMessage(userId, 'assistant', botReply);
+      if (botReply !== RATE_LIMIT_REPLY) await saveMessage(userId, 'assistant', botReply);
       await trimHistory(userId);
 
       await sendReply(message, botReply);
@@ -473,7 +371,6 @@ discord.on('messageCreate', async (message) => {
     }
 
     // ── Normal text path ──
-    // Get history
     const fullHistory   = await getHistory(userId);
     const fittedHistory = fitHistoryToTokenBudget(fullHistory, systemPrompt, userMessage);
 
@@ -482,14 +379,10 @@ discord.on('messageCreate', async (message) => {
       console.log(`[${userId}] Dropped ${droppedCount} messages to fit budget`);
     }
 
-    // Get reply
     const botReply = await getReply(fittedHistory, userMessage, systemPrompt);
 
-    // Save to DB
     await saveMessage(userId, 'user', userMessage);
-    if (botReply !== "i'm a bit rate-limited right now 😭 try again in a little bit") {
-      await saveMessage(userId, 'assistant', botReply);
-    }
+    if (botReply !== RATE_LIMIT_REPLY) await saveMessage(userId, 'assistant', botReply);
     await trimHistory(userId);
 
     await sendReply(message, botReply);
@@ -502,7 +395,7 @@ discord.on('messageCreate', async (message) => {
 
 discord.login(process.env.DISCORD_TOKEN);
 
-// Start a minimal web server so hosting providers treat this as a web service
+// ─── Web server (keeps hosting providers happy) ────────────────────────────
 const app = express();
 
 let lastKeepalive = null;
