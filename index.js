@@ -291,12 +291,21 @@ async function getVisionReply(imageUrl, userText, systemPrompt, history) {
 }
 
 // ─── Send helper (handles 2000 char limit) ─────────────────────────────────
+// Falls back to channel.send() when the original message was deleted
+// (Discord error 50035 / MESSAGE_REFERENCE_UNKNOWN_MESSAGE).
 async function sendReply(target, text) {
-  if (text.length > 1990) {
-    const chunks = text.match(/.{1,1990}/gs);
-    for (const chunk of chunks) await target.reply(chunk);
-  } else {
-    await target.reply(text);
+  const chunks = text.length > 1990 ? text.match(/.{1,1990}/gs) : [text];
+  for (const chunk of chunks) {
+    try {
+      await target.reply(chunk);
+    } catch (err) {
+      if (err.code === 50035) {
+        // Original message deleted — fall back to a plain channel message
+        await target.channel.send(chunk);
+      } else {
+        throw err; // re-throw anything unexpected
+      }
+    }
   }
 }
 
@@ -306,6 +315,11 @@ discord.once('clientReady', () => {
   console.log(`🔄 Text provider rotation: Groq (${TEXT_MODEL}) → ${cerebras ? `Cerebras (${TEXT_MODEL_CEREBRAS})` : 'Cerebras (not configured)'}`);
   console.log(`👁️  Vision model: ${VISION_MODEL} (Groq)`);
   console.log(`👑 Utkarsh ID: ${UTKARSH_USER_ID || 'not set'}`);
+});
+
+// Prevent unhandled Discord API errors from crashing the process
+discord.on('error', (err) => {
+  console.error('⚠️  Discord client error:', err.message);
 });
 
 discord.on('messageCreate', async (message) => {
